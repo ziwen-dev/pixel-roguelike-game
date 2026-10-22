@@ -9,6 +9,7 @@ export interface MapTileData {
   fertility?: number;
   resource?: ResourceType;
   resourceAmount?: number;
+  resourceZoneId?: number;
 }
 
 export interface MapBuildingData {
@@ -16,6 +17,8 @@ export interface MapBuildingData {
   type: BuildingType;
   tileX: number;
   tileY: number;
+  tileW?: number;
+  tileH?: number;
   complete?: boolean;
 }
 

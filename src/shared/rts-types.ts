@@ -14,7 +14,10 @@ export type UnitRole =
   | 'archer'
   | 'cavalry'
   | 'engineer'
-  | 'guard';
+  | 'guard'
+  | 'ram'
+  | 'catapult'
+  | 'ladder';
 export type BuildingType =
   | 'townHall'
   | 'house'
@@ -29,7 +32,7 @@ export type BuildingType =
   | 'gate'
   | 'bridge'
   | 'tower';
-export type OrderType = 'idle' | 'move' | 'attack' | 'gather' | 'build' | 'defend' | 'patrol' | 'trade';
+export type OrderType = 'idle' | 'move' | 'attack' | 'attackMove' | 'gather' | 'build' | 'defend' | 'patrol' | 'guard' | 'trade' | 'garrison';
 
 export interface RtsVector {
   x: number;
@@ -43,6 +46,8 @@ export interface Tile {
   fertility: number;
   resource?: ResourceType;
   resourceAmount?: number;
+  /** 同一资源区的编号。相邻的另一片资源即使种类相同，编号也不同 */
+  resourceZoneId?: number;
   maxResourceAmount?: number;
   resourceRegenAt?: number;
   depletedTerrain?: TerrainType;
@@ -64,10 +69,15 @@ export interface UnitOrder {
   targetId?: string;
   targetTile?: { x: number; y: number };
   resource?: ResourceType;
+  resourceZoneId?: number;
   returning?: boolean;
+  /** 低血量自动回营，回满后自行出营 */
+  autoHeal?: boolean;
   lockedTarget?: boolean;
   path?: RtsVector[];
   pathTarget?: RtsVector;
+  /** 巡逻的另一端 */
+  patrolOrigin?: RtsVector;
 }
 
 export interface Unit {
@@ -89,6 +99,8 @@ export interface Unit {
   carryingAmount: number;
   order: UnitOrder;
   selected: boolean;
+  /** 已进入兵营，不占地面、不挡路 */
+  garrisoned?: boolean;
   direction: 'up' | 'down' | 'left' | 'right';
   attackCooldown: number;
 }
@@ -107,6 +119,8 @@ export interface Building {
   progress: number;
   rallyPoint?: RtsVector;
   footprintTerrain?: TerrainType[];
+  /** 兵营练兵队列，remaining 为剩余秒数 */
+  trainQueue?: Array<{ role: UnitRole; remaining: number }>;
 }
 
 export interface DiplomacyEvent {
@@ -117,7 +131,9 @@ export interface DiplomacyEvent {
 
 export interface CombatEvent {
   id: string;
-  kind: 'melee' | 'arrow' | 'hit' | 'command' | 'gather' | 'deposit' | 'build';
+  kind: 'melee' | 'arrow' | 'hit' | 'command' | 'gather' | 'deposit' | 'build' | 'fall';
+  /** 攻击表现：斩击、突刺、箭矢、冲锋、箭塔 */
+  style?: 'slash' | 'thrust' | 'arrow' | 'cavalry' | 'bolt';
   x: number;
   y: number;
   targetX: number;
@@ -146,4 +162,13 @@ export interface RtsGameState {
   combatEvents: CombatEvent[];
   /** 战役结果：playing 进行中，victory 全灭敌方大本营，defeat 玩家主城被毁 */
   gameOutcome: 'playing' | 'victory' | 'defeat';
+  /** 战争迷雾开关 */
+  fogEnabled: boolean;
+  /** 敌军来袭或城池陷落提示 */
+  attackAlert?: { x: number; y: number; until: number; kind: 'raid' | 'fall' };
+  /** 已探索地块，1 为去过 */
+  fogExplored?: Uint8Array;
+  /** 本帧仍能看见的地块，值等于 fogFrame */
+  fogSeen?: Uint32Array;
+  fogFrame?: number;
 }

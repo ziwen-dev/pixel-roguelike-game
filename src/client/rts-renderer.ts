@@ -67,6 +67,9 @@ const UNIT_LABELS: Record<UnitRole, string> = {
   cavalry: '骑兵',
   engineer: '工兵',
   guard: '守卫',
+  ram: '冲车',
+  catapult: '投石车',
+  ladder: '云梯',
 };
 
 export class RtsRenderer {
@@ -74,10 +77,16 @@ export class RtsRenderer {
   private width: number;
   private height: number;
   private spriteSheets: Partial<Record<UnitRole, HTMLCanvasElement>> = {};
+  private singleSprites: Partial<Record<UnitRole, HTMLImageElement>> = {};
   private loadedSprites = new Set<UnitRole>();
   private effectSheet: HTMLCanvasElement | null = null;
   private combatEffectsLoaded = false;
   private miniMapLastDraw = 0;
+  private miniMapCache: HTMLCanvasElement | null = null;
+  private miniMapTerrain: HTMLCanvasElement | null = null;
+  private miniMapTerrainKey = '';
+  private miniMapLayout: { x: number; y: number; width: number; height: number; scaleX: number; scaleY: number } | null = null;
+  private readonly detailUnitCap = 42;
 
   constructor(ctx: CanvasRenderingContext2D, width: number, height: number) {
     this.ctx = ctx;
@@ -92,13 +101,14 @@ export class RtsRenderer {
     this.width = width;
     this.height = height;
     this.ctx.imageSmoothingEnabled = false;
+    this.miniMapLastDraw = 0;
   }
 
   render(
     state: RtsGameState,
     camera: { x: number; y: number; zoom: number },
     selection?: { active: boolean; startX: number; startY: number; endX: number; endY: number },
-    buildPreview?: { type: BuildingType; x: number; y: number; valid: boolean }
+    buildPreview?: { type: BuildingType; x: number; y: number; width?: number; height?: number; valid: boolean }
   ): void {
     const unitCount = Object.keys(state.units).length;
     const perfLite = unitCount > 48;
@@ -114,20 +124,34 @@ export class RtsRenderer {
     const bounds = this.getViewBounds(state, camera);
     this.drawTerrain(state, camera, perfLite);
     Object.values(state.buildings).forEach((building) => {
-      if (this.isInView(building.x, building.y, building.width, building.height, bounds)) {
+      if (!this.isInView(building.x, building.y, building.width, building.height, bounds)) return;
+      const vision = this.tileVision(state, building.x + building.width / 2, building.y + building.height / 2);
+      if (building.factionId !== 'player' && vision === 0) return;
+      if (building.factionId !== 'player' && vision === 1) {
+        this.ctx.save();
+        this.ctx.globalAlpha = 0.45;
         this.drawBuilding(state, building, perfLite);
+        this.ctx.restore();
+        return;
       }
+      this.drawBuilding(state, building, perfLite);
     });
     if (buildPreview) this.drawBuildPreview(state, buildPreview);
     if (!perfUltra) this.drawOrderFeedback(state);
     if (!perfUltra) this.drawCombatEvents(state);
+    const visibleUnits: Unit[] = [];
     Object.values(state.units).forEach((unit) => {
-      if (this.isInView(unit.x, unit.y, unit.width, unit.height, bounds)) {
-        this.drawUnit(state, unit, perfLite, perfUltra);
-      }
+      if (this.isInView(unit.x, unit.y, unit.width, unit.height, bounds)) visibleUnits.push(unit);
+    });
+    const detailed = this.pickDetailedUnits(visibleUnits, camera);
+    visibleUnits.forEach((unit) => {
+      if (unit.factionId !== 'player' && this.tileVision(state, unit.x + unit.width / 2, unit.y + unit.height / 2) !== 2) return;
+      const detailedThis = detailed.has(unit.id);
+      this.drawUnit(state, unit, !detailedThis, !detailedThis && !unit.selected);
     });
 
     this.ctx.restore();
+    this.drawAlertVignette(state);
 
     if (selection?.active) {
       this.drawSelectionRect(selection);
@@ -135,10 +159,33 @@ export class RtsRenderer {
 
     this.drawHud(state);
     const now = Date.now();
-    if (now - this.miniMapLastDraw > 200) {
+    if (now - this.miniMapLastDraw > 350 || !this.miniMapCache) {
       this.miniMapLastDraw = now;
-      this.drawMiniMap(state, camera);
+      this.paintMiniMapCache(state);
     }
+    this.blitMiniMap(camera);
+  }
+
+  getMiniMapLayout(): { x: number; y: number; width: number; height: number; scaleX: number; scaleY: number } | null {
+    return this.miniMapLayout;
+  }
+
+  private pickDetailedUnits(units: Unit[], camera: { x: number; y: number; zoom: number }): Set<string> {
+    const detailed = new Set<string>();
+    const cx = camera.x + this.width / camera.zoom / 2;
+    const cy = camera.y + this.height / camera.zoom / 2;
+    const ranked = units
+      .map((unit) => {
+        const ux = unit.x + unit.width / 2 - cx;
+        const uy = unit.y + unit.height / 2 - cy;
+        const priority = unit.selected || unit.role === 'commander' ? -1e12 : ux * ux + uy * uy;
+        return { id: unit.id, priority, force: unit.selected || unit.role === 'commander' };
+      })
+      .sort((a, b) => a.priority - b.priority);
+    ranked.forEach((entry, index) => {
+      if (entry.force || index < this.detailUnitCap) detailed.add(entry.id);
+    });
+    return detailed;
   }
 
   private getViewBounds(state: RtsGameState, camera: { x: number; y: number; zoom: number }) {
@@ -155,6 +202,21 @@ export class RtsRenderer {
 
   private isInView(x: number, y: number, w: number, h: number, bounds: ReturnType<RtsRenderer['getViewBounds']>): boolean {
     return x + w >= bounds.left && x <= bounds.right && y + h >= bounds.top && y <= bounds.bottom;
+  }
+
+  private hasLandNeighbor(state: RtsGameState, x: number, y: number): boolean {
+    const neighbors = [
+      [1, 0],
+      [-1, 0],
+      [0, 1],
+      [0, -1],
+    ];
+    return neighbors.some(([dx, dy]) => {
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= state.mapWidth || ny >= state.mapHeight) return false;
+      return state.tiles[ny * state.mapWidth + nx]?.terrain !== 'water';
+    });
   }
 
   private isCoastTile(state: RtsGameState, x: number, y: number): boolean {
@@ -190,8 +252,15 @@ export class RtsRenderer {
         if (!tile) continue;
         const screenX = Math.floor(x * tileSize);
         const screenY = Math.floor(y * tileSize);
+        const vision = this.tileVision(state, x * tileSize + tileSize / 2, y * tileSize + tileSize / 2);
+        if (vision === 0) {
+          this.ctx.fillStyle = '#050608';
+          this.ctx.fillRect(screenX, screenY, tileSize + overlap, tileSize + overlap);
+          continue;
+        }
 
-        this.ctx.fillStyle = TERRAIN_COLORS[tile.terrain];
+        const shallowWater = tile.terrain === 'water' && this.hasLandNeighbor(state, x, y);
+        this.ctx.fillStyle = shallowWater ? '#3d96c4' : TERRAIN_COLORS[tile.terrain];
         this.ctx.fillRect(screenX, screenY, tileSize + overlap, tileSize + overlap);
 
         if (!perfLite && tile.terrain !== 'water' && this.isCoastTile(state, x, y)) {
@@ -206,7 +275,7 @@ export class RtsRenderer {
         }
 
         if (!perfLite && tile.terrain === 'forest') {
-          this.ctx.fillStyle = '#3fa35e';
+          this.ctx.fillStyle = tile.resource === 'wood' ? '#57c56e' : '#2c6d40';
           this.ctx.fillRect(screenX + 10, screenY + 5, 12, 18);
           this.ctx.fillStyle = '#6b4b35';
           this.ctx.fillRect(screenX + 14, screenY + 18, 4, 10);
@@ -245,6 +314,32 @@ export class RtsRenderer {
             this.ctx.stroke();
           }
         }
+
+        if (vision === 1) {
+          this.ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
+          this.ctx.fillRect(screenX, screenY, tileSize + overlap, tileSize + overlap);
+        }
+
+        if (!perfLite && vision === 2 && tile.resourceZoneId !== undefined && (tile.resourceAmount ?? 0) > 0) {
+          this.ctx.strokeStyle = tile.resource === 'iron' ? 'rgba(196, 154, 108, 0.85)' : 'rgba(255, 214, 120, 0.8)';
+          this.ctx.lineWidth = 2;
+          this.ctx.beginPath();
+          const edges: Array<[number, number, number, number, number, number]> = [
+            [0, -1, screenX, screenY, screenX + tileSize, screenY],
+            [0, 1, screenX, screenY + tileSize, screenX + tileSize, screenY + tileSize],
+            [-1, 0, screenX, screenY, screenX, screenY + tileSize],
+            [1, 0, screenX + tileSize, screenY, screenX + tileSize, screenY + tileSize],
+          ];
+          edges.forEach(([dx, dy, x1, y1, x2, y2]) => {
+            const nx = x + dx;
+            const ny = y + dy;
+            const neighbor = nx < 0 || ny < 0 || nx >= state.mapWidth || ny >= state.mapHeight ? undefined : state.tiles[ny * state.mapWidth + nx];
+            if (neighbor?.resourceZoneId === tile.resourceZoneId) return;
+            this.ctx.moveTo(x1, y1);
+            this.ctx.lineTo(x2, y2);
+          });
+          this.ctx.stroke();
+        }
       }
     }
   }
@@ -261,8 +356,24 @@ export class RtsRenderer {
     this.ctx.lineWidth = 3;
     this.ctx.strokeRect(building.x, building.y, building.width, building.height);
 
-    if (building.type === 'wall' || building.type === 'gate') {
-      this.ctx.fillStyle = building.type === 'gate' ? '#4f3328' : '#6f7778';
+    if (building.type === 'gate') {
+      const horizontal = building.width >= building.height;
+      this.ctx.fillStyle = '#2a211c';
+      this.ctx.fillRect(building.x, building.y, building.width, building.height);
+      this.ctx.fillStyle = '#6a5344';
+      if (horizontal) {
+        this.ctx.fillRect(building.x, building.y, 6, building.height);
+        this.ctx.fillRect(building.x + building.width - 6, building.y, 6, building.height);
+        this.ctx.fillStyle = '#c9a06a';
+        this.ctx.fillRect(building.x, building.y, building.width, 3);
+      } else {
+        this.ctx.fillRect(building.x, building.y, building.width, 6);
+        this.ctx.fillRect(building.x, building.y + building.height - 6, building.width, 6);
+        this.ctx.fillStyle = '#c9a06a';
+        this.ctx.fillRect(building.x, building.y, 3, building.height);
+      }
+    } else if (building.type === 'wall') {
+      this.ctx.fillStyle = '#6f7778';
       this.ctx.fillRect(building.x + 4, building.y + 4, building.width - 8, building.height - 8);
       this.ctx.fillStyle = 'rgba(255,255,255,0.2)';
       this.ctx.fillRect(building.x + 4, building.y + 4, building.width - 8, 4);
@@ -312,6 +423,17 @@ export class RtsRenderer {
           ? '#ff5261'
           : '#ffd166';
       this.drawHealthBar(building.x, building.y - 7, building.width, building.health, building.maxHealth, barColor);
+      if (building.type === 'barracks' && building.complete) {
+        const inside = Object.values(state.units).filter((unit) => unit.garrisoned && unit.order.targetId === building.id).length;
+        if (inside > 0) {
+          this.ctx.fillStyle = 'rgba(8, 20, 14, 0.82)';
+          this.ctx.fillRect(building.x + building.width / 2 - 16, building.y + building.height / 2 - 9, 32, 16);
+          this.ctx.fillStyle = '#b8ffcf';
+          this.ctx.font = 'bold 12px Consolas, monospace';
+          this.ctx.textAlign = 'center';
+          this.ctx.fillText(`${inside}`, building.x + building.width / 2, building.y + building.height / 2 + 4);
+        }
+      }
     }
   }
 
@@ -394,6 +516,14 @@ export class RtsRenderer {
   }
 
   private drawUnit(state: RtsGameState, unit: Unit, perfLite = false, perfUltra = false): void {
+    if (unit.garrisoned) return;
+    const single = this.singleSprites[unit.role];
+    if (single) {
+      this.ctx.imageSmoothingEnabled = false;
+      this.ctx.drawImage(single, Math.round(unit.x), Math.round(unit.y), unit.width, unit.height);
+    } else if (unit.role === 'ram' || unit.role === 'catapult' || unit.role === 'ladder') {
+      this.drawSiegeGlyph(unit);
+    } else {
     const useSprite = !perfUltra || unit.selected || unit.role === 'commander';
     if (useSprite) {
       const frame = unit.order.type === 'attack' && unit.attackCooldown > 0.55 ? 'attack' : this.getCharacterFrame(unit.id, unit.direction);
@@ -404,6 +534,7 @@ export class RtsRenderer {
     } else {
       this.ctx.fillStyle = state.factions[unit.factionId]?.color ?? '#ffffff';
       this.ctx.fillRect(unit.x, unit.y, unit.width, unit.height);
+    }
     }
 
     if (unit.selected) {
@@ -448,7 +579,7 @@ export class RtsRenderer {
     this.ctx.fillRect(x, y, width * pct, 4);
   }
 
-  private drawBuildPreview(state: RtsGameState, preview: { type: BuildingType; x: number; y: number; valid: boolean }): void {
+  private drawBuildPreview(state: RtsGameState, preview: { type: BuildingType; x: number; y: number; width?: number; height?: number; valid: boolean }): void {
     const size = state.tileSize;
     const dims: Record<BuildingType, { width: number; height: number }> = {
       townHall: { width: 3, height: 3 },
@@ -461,11 +592,11 @@ export class RtsRenderer {
       smithy: { width: 2, height: 2 },
       stable: { width: 3, height: 2 },
       wall: { width: 1, height: 1 },
-      gate: { width: 1, height: 1 },
+      gate: { width: 4, height: 1 },
       bridge: { width: 1, height: 1 },
       tower: { width: 1, height: 1 },
     };
-    const dim = dims[preview.type];
+    const dim = { width: preview.width ?? dims[preview.type].width, height: preview.height ?? dims[preview.type].height };
     this.ctx.save();
     this.ctx.globalAlpha = 0.45;
     this.ctx.fillStyle = preview.valid ? '#39ff88' : '#ff5261';
@@ -604,30 +735,8 @@ export class RtsRenderer {
       this.ctx.save();
       this.ctx.globalAlpha = alpha;
 
-      if (event.kind === 'arrow') {
-        if (this.drawEffectAlongLine('arrow', progress, event.x, event.y, event.targetX, event.targetY, 58, 26)) {
-          this.ctx.restore();
-          return;
-        }
-        const x = event.x + (event.targetX - event.x) * progress;
-        const y = event.y + (event.targetY - event.y) * progress;
-        const angle = Math.atan2(event.targetY - event.y, event.targetX - event.x);
-        this.ctx.strokeStyle = '#f4e7b2';
-        this.ctx.lineWidth = 3;
-        this.ctx.beginPath();
-        this.ctx.moveTo(x - Math.cos(angle) * 12, y - Math.sin(angle) * 12);
-        this.ctx.lineTo(x + Math.cos(angle) * 12, y + Math.sin(angle) * 12);
-        this.ctx.stroke();
-      } else if (event.kind === 'melee') {
-        if (this.drawEffectAt('slash', progress, event.targetX, event.targetY, 54, 54)) {
-          this.ctx.restore();
-          return;
-        }
-        this.ctx.strokeStyle = '#ffd166';
-        this.ctx.lineWidth = 6;
-        this.ctx.beginPath();
-        this.ctx.arc(event.targetX, event.targetY, 18 + progress * 10, -0.7, 1.3);
-        this.ctx.stroke();
+      if (event.kind === 'arrow' || event.kind === 'melee') {
+        this.drawWeaponEffect(event, progress);
       } else if (event.kind === 'hit') {
         if (this.drawEffectAt('hit', progress, event.targetX, event.targetY, 44, 44)) {
           this.ctx.restore();
@@ -656,6 +765,13 @@ export class RtsRenderer {
         this.ctx.font = 'bold 14px Consolas, monospace';
         this.ctx.textAlign = 'center';
         this.ctx.fillText(label, event.x, event.y - 18 - progress * 20);
+      } else if (event.kind === 'fall') {
+        this.ctx.fillStyle = `rgba(255, 90, 30, ${0.55 * alpha})`;
+        this.ctx.beginPath();
+        this.ctx.arc(event.x, event.y, 18 + progress * 46, 0, Math.PI * 2);
+        this.ctx.fill();
+        this.ctx.fillStyle = '#ffd166';
+        this.ctx.fillRect(event.x - 4, event.y - 16 - progress * 20, 8, 18);
       } else if (event.kind === 'build') {
         this.ctx.strokeStyle = '#ffd166';
         this.ctx.fillStyle = '#fff0b8';
@@ -668,20 +784,95 @@ export class RtsRenderer {
         this.ctx.fillRect(event.targetX - 3, event.targetY - 3 - progress * 10, 6, 6);
       }
 
-      if (progress > 0.75 && (event.kind === 'arrow' || event.kind === 'melee')) {
-        this.ctx.strokeStyle = '#ff5261';
-        this.ctx.lineWidth = 3;
-        const size = 5 + progress * 8;
-        this.ctx.beginPath();
-        this.ctx.moveTo(event.targetX - size, event.targetY);
-        this.ctx.lineTo(event.targetX + size, event.targetY);
-        this.ctx.moveTo(event.targetX, event.targetY - size);
-        this.ctx.lineTo(event.targetX, event.targetY + size);
-        this.ctx.stroke();
+      if (progress > 0.72 && (event.kind === 'arrow' || event.kind === 'melee' || event.kind === 'hit')) {
+        this.drawImpactBurst(event.targetX, event.targetY, progress, event.style === 'bolt' ? '#7ecbff' : '#ff5261');
       }
 
       this.ctx.restore();
     });
+  }
+
+  private drawWeaponEffect(event: RtsGameState['combatEvents'][number], progress: number): void {
+    const style = event.style ?? (event.kind === 'arrow' ? 'arrow' : 'slash');
+    const angle = Math.atan2(event.targetY - event.y, event.targetX - event.x);
+    const x = event.x + (event.targetX - event.x) * progress;
+    const y = event.y + (event.targetY - event.y) * progress;
+
+    if (style === 'arrow' || style === 'bolt') {
+      this.ctx.strokeStyle = style === 'bolt' ? 'rgba(126, 203, 255, 0.5)' : 'rgba(244, 231, 178, 0.4)';
+      this.ctx.lineWidth = style === 'bolt' ? 4 : 2;
+      this.ctx.beginPath();
+      this.ctx.moveTo(event.x, event.y);
+      this.ctx.lineTo(x, y);
+      this.ctx.stroke();
+      this.drawEffectAlongLine('arrow', progress, event.x, event.y, event.targetX, event.targetY, style === 'bolt' ? 44 : 58, style === 'bolt' ? 20 : 26);
+      this.ctx.save();
+      this.ctx.translate(x, y);
+      this.ctx.rotate(angle);
+      this.ctx.fillStyle = style === 'bolt' ? '#d7f2ff' : '#f4e7b2';
+      this.ctx.fillRect(-14, -2, 22, 4);
+      this.ctx.fillStyle = style === 'bolt' ? '#7ecbff' : '#fff8df';
+      this.ctx.beginPath();
+      this.ctx.moveTo(10, 0);
+      this.ctx.lineTo(2, -5);
+      this.ctx.lineTo(2, 5);
+      this.ctx.fill();
+      this.ctx.restore();
+      return;
+    }
+
+    if (style === 'thrust') {
+      this.drawEffectAt('thrust', progress, event.targetX, event.targetY, 68, 28, angle);
+      const reach = 16 + progress * 34;
+      this.ctx.strokeStyle = '#f4f7ee';
+      this.ctx.lineWidth = 3;
+      this.ctx.beginPath();
+      this.ctx.moveTo(event.targetX - Math.cos(angle) * reach, event.targetY - Math.sin(angle) * reach);
+      this.ctx.lineTo(event.targetX + Math.cos(angle) * 8, event.targetY + Math.sin(angle) * 8);
+      this.ctx.stroke();
+      this.ctx.fillStyle = '#ffd166';
+      this.ctx.beginPath();
+      this.ctx.arc(event.targetX + Math.cos(angle) * 8, event.targetY + Math.sin(angle) * 8, 3.5, 0, Math.PI * 2);
+      this.ctx.fill();
+      return;
+    }
+
+    if (style === 'cavalry') {
+      this.drawEffectAt('slash', progress, event.targetX, event.targetY, 82, 82, angle);
+      this.ctx.strokeStyle = '#ffd166';
+      this.ctx.lineWidth = 5;
+      this.ctx.beginPath();
+      this.ctx.arc(event.targetX, event.targetY, 14 + progress * 24, angle - 1.5, angle + 0.9);
+      this.ctx.stroke();
+      this.ctx.fillStyle = 'rgba(232, 214, 170, 0.85)';
+      for (let i = 0; i < 5; i++) {
+        const dust = angle + Math.PI + i * 0.35;
+        const dist = 8 + progress * (14 + i * 7);
+        this.ctx.fillRect(event.x + Math.cos(dust) * dist - 2, event.y + Math.sin(dust) * dist - 2, 4, 4);
+      }
+      return;
+    }
+
+    this.drawEffectAt('slash', progress, event.targetX, event.targetY, 62, 62, angle);
+    this.ctx.strokeStyle = '#fff0b0';
+    this.ctx.lineWidth = 4;
+    this.ctx.beginPath();
+    this.ctx.arc(event.targetX, event.targetY, 10 + progress * 18, angle - 1.15, angle + 1.2);
+    this.ctx.stroke();
+  }
+
+  private drawImpactBurst(x: number, y: number, progress: number, color: string): void {
+    this.drawEffectAt('hit', progress, x, y, 44, 44);
+    this.ctx.strokeStyle = color;
+    this.ctx.lineWidth = 2;
+    const size = 6 + progress * 12;
+    for (let i = 0; i < 6; i++) {
+      const angle = (Math.PI * 2 * i) / 6 + progress;
+      this.ctx.beginPath();
+      this.ctx.moveTo(x + Math.cos(angle) * 3, y + Math.sin(angle) * 3);
+      this.ctx.lineTo(x + Math.cos(angle) * size, y + Math.sin(angle) * size);
+      this.ctx.stroke();
+    }
   }
 
   private drawEffectAlongLine(
@@ -784,38 +975,220 @@ export class RtsRenderer {
     this.ctx.fillText(log, 360, 65);
   }
 
-  private drawMiniMap(state: RtsGameState, camera: { x: number; y: number; zoom: number }): void {
+  private computeMiniMapLayout(state: RtsGameState): { x: number; y: number; width: number; height: number; scaleX: number; scaleY: number } {
     const mapWidth = state.mapWidth * state.tileSize;
     const mapHeight = state.mapHeight * state.tileSize;
     const width = Math.min(168, Math.max(118, this.width * 0.22));
     const height = width * (mapHeight / mapWidth);
-    const x = this.width - width - 12;
-    const y = 86;
-    const scaleX = width / mapWidth;
-    const scaleY = height / mapHeight;
+    return {
+      x: this.width - width - 12,
+      y: 86,
+      width,
+      height,
+      scaleX: width / mapWidth,
+      scaleY: height / mapHeight,
+    };
+  }
 
+  /** 小地图缓存包含全图单位，不受主画面视口裁剪影响。 */
+  private paintMiniMapCache(state: RtsGameState): void {
+    const layout = this.computeMiniMapLayout(state);
+    this.miniMapLayout = layout;
+    const cache = this.miniMapCache ?? document.createElement('canvas');
+    const w = Math.max(1, Math.ceil(layout.width));
+    const h = Math.max(1, Math.ceil(layout.height));
+    if (cache.width !== w || cache.height !== h) {
+      cache.width = w;
+      cache.height = h;
+    }
+    const ctx = cache.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, w, h);
+    const terrain = this.ensureMiniMapTerrain(state, w, h);
+    if (terrain) ctx.drawImage(terrain, 0, 0, w, h);
+    else {
+      ctx.fillStyle = 'rgba(7, 9, 12, 0.92)';
+      ctx.fillRect(0, 0, w, h);
+    }
+
+    if (state.fogEnabled && state.fogExplored) {
+      const image = ctx.getImageData(0, 0, w, h);
+      const pixels = image.data;
+      for (let py = 0; py < h; py++) {
+        const tileY = Math.min(state.mapHeight - 1, Math.floor((py / h) * state.mapHeight));
+        for (let px = 0; px < w; px++) {
+          const tileX = Math.min(state.mapWidth - 1, Math.floor((px / w) * state.mapWidth));
+          const vision = this.tileVision(state, tileX * state.tileSize, tileY * state.tileSize);
+          const index = (py * w + px) * 4;
+          if (vision === 0) {
+            pixels[index] = 5;
+            pixels[index + 1] = 6;
+            pixels[index + 2] = 8;
+          } else if (vision === 1) {
+            pixels[index] = Math.floor(pixels[index] * 0.45);
+            pixels[index + 1] = Math.floor(pixels[index + 1] * 0.45);
+            pixels[index + 2] = Math.floor(pixels[index + 2] * 0.45);
+          }
+        }
+      }
+      ctx.putImageData(image, 0, 0);
+    }
+
+    Object.values(state.buildings).forEach((building) => {
+      if (building.type === 'wall') return;
+      const vision = this.tileVision(state, building.x + building.width / 2, building.y + building.height / 2);
+      if (building.factionId !== 'player' && vision === 0) return;
+      ctx.fillStyle = building.factionId === 'player' ? '#c79b58' : '#6a5a4a';
+      ctx.fillRect(
+        (building.x / (state.mapWidth * state.tileSize)) * w,
+        (building.y / (state.mapHeight * state.tileSize)) * h,
+        Math.max(2, (building.width / (state.mapWidth * state.tileSize)) * w),
+        Math.max(2, (building.height / (state.mapHeight * state.tileSize)) * h)
+      );
+    });
+
+    Object.values(state.units).forEach((unit) => {
+      if (unit.garrisoned) return;
+      if (unit.factionId !== 'player' && this.tileVision(state, unit.x, unit.y) !== 2) return;
+      const cx = ((unit.x + unit.width / 2) / (state.mapWidth * state.tileSize)) * w;
+      const cy = ((unit.y + unit.height / 2) / (state.mapHeight * state.tileSize)) * h;
+      if (unit.factionId === 'player' && unit.role === 'commander') ctx.fillStyle = '#ffd166';
+      else if (unit.factionId === 'player') ctx.fillStyle = '#39ff88';
+      else if ((state.factions.player.relations[unit.factionId] ?? 0) < -20) ctx.fillStyle = '#ff5261';
+      else ctx.fillStyle = '#d0d6cf';
+      ctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
+    });
+    const alert = state.attackAlert;
+    if (alert && Date.now() < alert.until) {
+      const ax = (alert.x / (state.mapWidth * state.tileSize)) * w;
+      const ay = (alert.y / (state.mapHeight * state.tileSize)) * h;
+      ctx.strokeStyle = alert.kind === 'fall' ? '#ffd166' : '#ff5261';
+      ctx.lineWidth = 2;
+      const pulse = 4 + ((Date.now() / 180) % 8);
+      ctx.beginPath();
+      ctx.arc(ax, ay, pulse, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+    this.miniMapCache = cache;
+  }
+
+  private tileVision(state: RtsGameState, worldX: number, worldY: number): 0 | 1 | 2 {
+    if (!state.fogEnabled || !state.fogExplored || !state.fogSeen || state.fogFrame === undefined) return 2;
+    const x = Math.floor(worldX / state.tileSize);
+    const y = Math.floor(worldY / state.tileSize);
+    if (x < 0 || y < 0 || x >= state.mapWidth || y >= state.mapHeight) return 0;
+    const index = y * state.mapWidth + x;
+    if (!state.fogExplored[index]) return 0;
+    return state.fogSeen[index] === state.fogFrame ? 2 : 1;
+  }
+
+  private drawAlertVignette(state: RtsGameState): void {
+    const alert = state.attackAlert;
+    if (!alert || Date.now() >= alert.until) return;
+    const remain = (alert.until - Date.now()) / (alert.kind === 'fall' ? 4200 : 9000);
+    const alpha = Math.max(0, Math.min(0.55, remain)) * (alert.kind === 'fall' ? 0.7 : 1);
+    const gradient = this.ctx.createRadialGradient(
+      this.width / 2,
+      this.height / 2,
+      Math.min(this.width, this.height) * 0.35,
+      this.width / 2,
+      this.height / 2,
+      Math.max(this.width, this.height) * 0.72
+    );
+    gradient.addColorStop(0, 'rgba(0,0,0,0)');
+    gradient.addColorStop(1, alert.kind === 'fall' ? `rgba(255, 120, 40, ${alpha})` : `rgba(160, 20, 28, ${alpha})`);
+    this.ctx.fillStyle = gradient;
+    this.ctx.fillRect(0, 0, this.width, this.height);
+  }
+
+  private drawSiegeGlyph(unit: Unit): void {
+    const x = unit.x;
+    const y = unit.y;
+    if (unit.role === 'ladder') {
+      this.ctx.strokeStyle = '#c48a4a';
+      this.ctx.lineWidth = 3;
+      this.ctx.beginPath();
+      this.ctx.moveTo(x + 10, y + 4);
+      this.ctx.lineTo(x + 18, y + unit.height - 4);
+      this.ctx.moveTo(x + 28, y + 4);
+      this.ctx.lineTo(x + 36, y + unit.height - 4);
+      this.ctx.stroke();
+      this.ctx.lineWidth = 2;
+      for (let step = 10; step < unit.height - 6; step += 8) {
+        this.ctx.beginPath();
+        this.ctx.moveTo(x + 12, y + step);
+        this.ctx.lineTo(x + 32, y + step);
+        this.ctx.stroke();
+      }
+      return;
+    }
+    this.ctx.fillStyle = '#8a5a32';
+    this.ctx.fillRect(x + 4, y + 10, unit.width - 16, 12);
+    this.ctx.fillStyle = '#d0d4d8';
+    if (unit.role === 'ram') this.ctx.fillRect(x + unit.width - 16, y + 8, 14, 16);
+    this.ctx.fillStyle = '#5c3b24';
+    this.ctx.beginPath();
+    this.ctx.arc(x + 14, y + unit.height - 6, 5, 0, Math.PI * 2);
+    this.ctx.arc(x + unit.width - 18, y + unit.height - 6, 5, 0, Math.PI * 2);
+    this.ctx.fill();
+    if (unit.role === 'catapult') {
+      this.ctx.strokeStyle = '#e7c07a';
+      this.ctx.lineWidth = 3;
+      this.ctx.beginPath();
+      this.ctx.moveTo(x + 16, y + 22);
+      this.ctx.lineTo(x + 34, y + 4);
+      this.ctx.stroke();
+    }
+  }
+
+  private ensureMiniMapTerrain(state: RtsGameState, width: number, height: number): HTMLCanvasElement | null {
+    let hash = state.mapWidth * 131 + state.mapHeight;
+    for (let i = 0; i < state.tiles.length; i += 113) hash = (hash * 33 + state.tiles[i].terrain.charCodeAt(0)) | 0;
+    const key = `${width}x${height}:${hash}`;
+    if (this.miniMapTerrain && this.miniMapTerrainKey === key) return this.miniMapTerrain;
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const image = ctx.createImageData(width, height);
+    const data = image.data;
+    const colors: Record<string, [number, number, number]> = {
+      grass: [47, 125, 69],
+      forest: [31, 95, 56],
+      mountain: [101, 111, 114],
+      water: [20, 58, 86],
+      road: [138, 111, 76],
+      field: [138, 169, 77],
+      bridge: [143, 106, 67],
+    };
+    for (let py = 0; py < height; py++) {
+      const tileY = Math.min(state.mapHeight - 1, Math.floor((py / height) * state.mapHeight));
+      for (let px = 0; px < width; px++) {
+        const tileX = Math.min(state.mapWidth - 1, Math.floor((px / width) * state.mapWidth));
+        const tile = state.tiles[tileY * state.mapWidth + tileX];
+        const color = colors[tile?.terrain ?? 'water'] ?? colors.water;
+        const index = (py * width + px) * 4;
+        data[index] = color[0];
+        data[index + 1] = color[1];
+        data[index + 2] = color[2];
+        data[index + 3] = 235;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    this.miniMapTerrain = canvas;
+    this.miniMapTerrainKey = key;
+    return canvas;
+  }
+
+  private blitMiniMap(camera: { x: number; y: number; zoom: number }): void {
+    if (!this.miniMapCache || !this.miniMapLayout) return;
+    const { x, y, width, height, scaleX, scaleY } = this.miniMapLayout;
     this.ctx.save();
-    this.ctx.fillStyle = 'rgba(7, 9, 12, 0.82)';
-    this.ctx.fillRect(x, y, width, height);
+    this.ctx.drawImage(this.miniMapCache, x, y, width, height);
     this.ctx.strokeStyle = 'rgba(244, 247, 238, 0.35)';
     this.ctx.lineWidth = 1;
     this.ctx.strokeRect(x, y, width, height);
-
-    Object.values(state.units).forEach((unit) => {
-      const cx = x + (unit.x + unit.width / 2) * scaleX;
-      const cy = y + (unit.y + unit.height / 2) * scaleY;
-      if (unit.factionId === 'player' && unit.role === 'commander') {
-        this.ctx.fillStyle = '#ffd166';
-      } else if (unit.factionId === 'player') {
-        this.ctx.fillStyle = '#39ff88';
-      } else if ((state.factions.player.relations[unit.factionId] ?? 0) < -20) {
-        this.ctx.fillStyle = '#ff5261';
-      } else {
-        this.ctx.fillStyle = '#9aa79b';
-      }
-      this.ctx.fillRect(cx - 2, cy - 2, 4, 4);
-    });
-
     const viewX = x + camera.x * scaleX;
     const viewY = y + camera.y * scaleY;
     const viewW = (this.width / camera.zoom) * scaleX;
@@ -823,7 +1196,6 @@ export class RtsRenderer {
     this.ctx.strokeStyle = '#50d9ff';
     this.ctx.lineWidth = 1.5;
     this.ctx.strokeRect(viewX, viewY, viewW, viewH);
-
     this.ctx.restore();
   }
 
@@ -842,6 +1214,13 @@ export class RtsRenderer {
 
   private loadSprites(): void {
     const roles: UnitRole[] = ['commander', 'worker', 'woodcutter', 'stonecutter', 'miner', 'farmer', 'trader', 'swordsman', 'spearman', 'archer', 'cavalry', 'engineer', 'guard'];
+    (['ram', 'catapult', 'ladder'] as UnitRole[]).forEach((role) => {
+      const image = new Image();
+      image.onload = () => {
+        this.singleSprites[role] = image;
+      };
+      image.src = `${SPRITE_BASE_PATH}${role}.png`;
+    });
     roles.forEach((role) => {
       const image = new Image();
       image.onload = () => {

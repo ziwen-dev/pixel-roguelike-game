@@ -24,6 +24,7 @@
 
 **共享逻辑：**
 - `src/shared/rts-world.ts` — RTS 模拟（建造、战斗、经济、寻路）
+- 玩法与数值说明见 [docs/游戏设计.md](docs/游戏设计.md)
 
 ## 快速开始
 

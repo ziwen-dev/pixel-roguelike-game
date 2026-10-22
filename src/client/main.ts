@@ -32,19 +32,21 @@ const camera = {
 let actionButtonHost: HTMLElement = actionPanel;
 
 function createWorld(): RtsWorld {
+  let created = new RtsWorld();
   try {
     const raw = sessionStorage.getItem(CUSTOM_MAP_STORAGE_KEY);
     if (raw) {
       const mapData = JSON.parse(raw) as MapData;
       if (mapData.version === 1 && mapData.mapWidth && mapData.mapHeight) {
         sessionStorage.removeItem(CUSTOM_MAP_STORAGE_KEY);
-        return new RtsWorld({ mapData });
+        created = new RtsWorld({ mapData });
       }
     }
   } catch {
     /* 使用默认地图 */
   }
-  return new RtsWorld();
+  if (localStorage.getItem('rts-fog') === '0') created.setFogEnabled(false);
+  return created;
 }
 
 function resizeCanvas(): void {
@@ -116,7 +118,17 @@ const recruitMilitaryOptions: Array<{ role: UnitRole; label: string }> = [
   { role: 'archer', label: '弓箭手' },
   { role: 'cavalry', label: '骑兵' },
   { role: 'guard', label: '守卫' },
+  { role: 'ram', label: '冲车' },
+  { role: 'catapult', label: '投石车' },
+  { role: 'ladder', label: '云梯' },
 ];
+
+type GroundOrder = 'move' | 'attackMove' | 'patrol' | 'guard';
+let groundOrder: GroundOrder = 'move';
+const controlGroups: Record<number, string[]> = {};
+let lastAlertUntil = 0;
+let audioContext: AudioContext | null = null;
+let lastQueuePanelSecond = 0;
 
 let recruitTab: RecruitTab = 'economy';
 let gameOutcomeOverlay: HTMLElement | null = null;
@@ -240,6 +252,12 @@ function renderActionPanel(): void {
     const building = world.state.buildings[viewedBuildingId];
     if (building) {
       appendBuildingDetailCard(building);
+      if (building.trainQueue?.length) {
+        const queue = document.createElement('p');
+        queue.className = 'buildingDetailSummary';
+        queue.textContent = `训练队列：${building.trainQueue.map((job) => `${getUnitName(job.role)} ${Math.ceil(job.remaining)}秒`).join('，')}`;
+        actionPanel.appendChild(queue);
+      }
       const buttonRow = document.createElement('div');
       buttonRow.className = 'actionPanelRow';
       actionPanel.appendChild(buttonRow);
@@ -285,6 +303,23 @@ function renderActionPanel(): void {
           button.addEventListener('click', () => enterBuildMode(option.type));
           buttonRow.appendChild(button);
         });
+      }
+
+      if (building.type === 'barracks' && building.complete) {
+        const recall = makeActionButton('召回最近', false);
+        recall.addEventListener('click', () => {
+          const recalled = world.commandRecallNearest(building.id);
+          interactionHint = recalled > 0 ? `召回最近的 ${recalled} 名士兵` : '没有可召回的士兵，或兵营已满';
+          renderActionPanel();
+        });
+        buttonRow.appendChild(recall);
+        const release = makeActionButton('全体出营', false);
+        release.addEventListener('click', () => {
+          const released = world.commandReleaseBarracks(building.id);
+          interactionHint = released > 0 ? `${released} 名士兵离开兵营` : '兵营里没有士兵';
+          renderActionPanel();
+        });
+        buttonRow.appendChild(release);
       }
 
       if (building.type !== 'townHall') {
@@ -343,12 +378,30 @@ function renderActionPanel(): void {
     return;
   }
 
+  if (world.state.selectedUnitIds.length > 0) {
+    addUtilityButton('攻击移动', () => {
+      groundOrder = 'attackMove';
+      interactionHint = '下一击地面：边走边打，遇到敌人会停下攻击';
+    });
+    addUtilityButton('巡逻', () => {
+      groundOrder = 'patrol';
+      interactionHint = '下一击地面：在当前位置和目标之间巡逻';
+    });
+    addUtilityButton('驻守', () => {
+      groundOrder = 'guard';
+      interactionHint = '下一击地面：守在那里，敌人靠近才出手';
+    });
+    addUtilityButton(world.formation === 'line' ? '阵型:横队' : '阵型:锋矢', () => {
+      const next = world.toggleFormation();
+      interactionHint = next === 'line' ? '横队：弓箭和投石车在后排' : '锋矢：前窄后宽，弓箭在后';
+      renderActionPanel();
+    });
+  }
   addUtilityButton('军队', selectAllCombatUnits);
   addUtilityButton('工人', selectAllWorkers);
   addUtilityButton('农民', selectAllFarmers);
   addUtilityButton('采集', selectAllGatherers);
   addUtilityButton('主城', focusTownHall);
-  addDisabledButton(interactionHint);
 }
 
 function renderModePanel(): void {
@@ -364,6 +417,13 @@ function renderModePanel(): void {
   });
   addModeButton('招募', mode === 'recruit', enterRecruitMode);
   addModeButton('将领', mode === 'commander', toggleCommanderMode);
+  addModeButton(world.state.fogEnabled ? '迷雾:开' : '迷雾:关', world.state.fogEnabled, () => {
+    const enabled = !world.state.fogEnabled;
+    world.setFogEnabled(enabled);
+    localStorage.setItem('rts-fog', enabled ? '1' : '0');
+    interactionHint = enabled ? '战争迷雾已打开：没侦察过的地方是黑的' : '战争迷雾已关闭，全图可见';
+    renderActionPanel();
+  });
   addModeButton('取消', false, cancelCurrentAction);
 }
 
@@ -440,7 +500,7 @@ function makeRecruitButton(label: string, role: UnitRole): HTMLButtonElement {
   const button = document.createElement('button');
   const affordable = world.canAffordRecruit(role);
   button.className = `touchBtn recruitBtn${affordable ? '' : ' unaffordable'}`;
-  button.innerHTML = `<span class="recruitName">${label}</span><span class="recruitCost">${world.getRecruitCostText(role)}</span>`;
+  button.innerHTML = `<span class="recruitIcon" style="background-image:url('/assets/sprites/${role}.png')"></span><span class="recruitName">${label}</span><span class="recruitCost">${world.getRecruitCostText(role)}</span>`;
   button.addEventListener('click', () => {
     const ok = world.recruit(role);
     interactionHint = ok ? `已招募：${label}` : `资源不足：${world.getRecruitCostText(role)}`;
@@ -499,6 +559,24 @@ function handleTap(worldPoint: RtsVector): void {
       renderActionPanel();
       return;
     }
+    if (building.complete && building.type === 'barracks') {
+      const selectedSoldiers = world.state.selectedUnitIds.filter((id) => {
+        const unit = world.state.units[id];
+        return unit && world.isMilitaryRole(unit.role);
+      });
+      if (selectedSoldiers.length > 0) {
+        const sent = world.commandGarrison(building.id, selectedSoldiers);
+        interactionHint = sent > 0 ? `${sent} 名士兵返回兵营` : '这些单位不能进兵营';
+      } else if (world.state.selectedUnitIds.length === 0) {
+        const recalled = world.commandRecallNearest(building.id);
+        interactionHint = recalled > 0 ? `召回最近的 ${recalled} 名士兵` : '附近没有可召回的士兵，或兵营已满';
+      } else {
+        interactionHint = '兵营：可招募，或框选士兵后点这里回营';
+      }
+      viewedBuildingId = building.id;
+      renderActionPanel();
+      return;
+    }
     viewedBuildingId = building.id;
     interactionHint = `建筑：${getBuildingName(building.type)}`;
     renderActionPanel();
@@ -522,21 +600,49 @@ function handleTap(worldPoint: RtsVector): void {
   const resource = world.getResourceAt(worldPoint);
   if (resource) {
     const ok = world.commandSelectedGather(worldPoint);
-    const amount = Math.floor(world.getTileInfoAt(worldPoint)?.resourceAmount ?? 0);
-    interactionHint = ok ? `采集资源：${getResourceName(resource)} ${amount}` : `需要先选择工人，再采集${getResourceName(resource)}`;
+    const zone = world.getResourceZoneStatus(worldPoint);
+    interactionHint = ok
+      ? `采集资源区：${getResourceName(resource)}，剩余 ${zone?.remainingTiles ?? 0} 格`
+      : `需要先选择对应工人，再采集${getResourceName(resource)}`;
     renderActionPanel();
     return;
   }
 
   if (world.state.selectedUnitIds.length > 0) {
-    world.commandSelectedMove(worldPoint);
+    if (groundOrder === 'attackMove') world.commandSelectedAttackMove(worldPoint);
+    else if (groundOrder === 'patrol') world.commandSelectedPatrol(worldPoint);
+    else if (groundOrder === 'guard') world.commandSelectedGuard(worldPoint);
+    else world.commandSelectedMove(worldPoint);
     setFollowedUnit(world.state.selectedUnitIds.length === 1 ? world.state.selectedUnitIds[0] : null);
-    interactionHint = '移动命令已下达';
+    interactionHint = groundOrder === 'attackMove' ? '攻击移动已下达' : groundOrder === 'patrol' ? '巡逻已下达' : groundOrder === 'guard' ? '驻守已下达' : '移动命令已下达';
+    groundOrder = 'move';
   } else {
     const tile = world.getTileInfoAt(worldPoint);
     interactionHint = tile ? `地形：${getTerrainName(tile.terrain)}` : '地图边界';
   }
   renderActionPanel();
+}
+
+let minimapDragging = false;
+
+function centerCameraAt(worldX: number, worldY: number): void {
+  camera.x = worldX - canvas.width / camera.zoom / 2;
+  camera.y = worldY - canvas.height / camera.zoom / 2;
+  clampCamera();
+  setFollowedUnit(null);
+}
+
+function minimapWorldAt(clientX: number, clientY: number): { x: number; y: number } | null {
+  const layout = renderer.getMiniMapLayout();
+  if (!layout) return null;
+  const point = screenPoint(clientX, clientY);
+  if (point.x < layout.x || point.y < layout.y || point.x > layout.x + layout.width || point.y > layout.y + layout.height) {
+    return null;
+  }
+  return {
+    x: (point.x - layout.x) / layout.scaleX,
+    y: (point.y - layout.y) / layout.scaleY,
+  };
 }
 
 canvas.addEventListener('pointerdown', (event) => {
@@ -556,6 +662,7 @@ canvas.addEventListener('pointerdown', (event) => {
 
   if (activePointers.size > 1) return;
 
+  ensureAudio();
   pointerDown = true;
   dragStarted = false;
   panStarted = false;
@@ -564,6 +671,15 @@ canvas.addEventListener('pointerdown', (event) => {
   pointerCurrentWorld = screenToWorld(event.clientX, event.clientY);
   pointerStartOnFriendly = world.getUnitAt(pointerCurrentWorld)?.factionId === 'player';
   lastWallTile = '';
+
+  const mini = minimapWorldAt(event.clientX, event.clientY);
+  if (mini) {
+    minimapDragging = true;
+    panStarted = true;
+    centerCameraAt(mini.x, mini.y);
+    interactionHint = '小地图：拖动浏览全图单位';
+    return;
+  }
 
   selection.active = false;
   selection.startX = pointerStartScreen.x;
@@ -583,6 +699,12 @@ canvas.addEventListener('pointermove', (event) => {
 
   if (!pointerDown) return;
   const point = screenPoint(event.clientX, event.clientY);
+  if (minimapDragging) {
+    const mini = minimapWorldAt(event.clientX, event.clientY);
+    if (mini) centerCameraAt(mini.x, mini.y);
+    pointerLastScreen = point;
+    return;
+  }
   pointerCurrentWorld = screenToWorld(event.clientX, event.clientY);
   const dx = point.x - pointerLastScreen.x;
   const dy = point.y - pointerLastScreen.y;
@@ -636,6 +758,12 @@ canvas.addEventListener('pointerup', (event) => {
 
   if (!pointerDown) return;
   pointerDown = false;
+  if (minimapDragging) {
+    minimapDragging = false;
+    panStarted = false;
+    selection.active = false;
+    return;
+  }
   const point = screenPoint(event.clientX, event.clientY);
   const totalDx = point.x - pointerStartScreen.x;
   const totalDy = point.y - pointerStartScreen.y;
@@ -666,6 +794,7 @@ canvas.addEventListener('pointercancel', (event) => {
   pointerDown = false;
   selection.active = false;
   panStarted = false;
+  minimapDragging = false;
 });
 
 canvas.addEventListener('contextmenu', (event) => event.preventDefault());
@@ -746,7 +875,12 @@ function updateCameraFollow(): void {
   camera.y = unit.y + unit.height / 2 - canvas.height / camera.zoom / 2;
 }
 
+let statusStamp = 0;
+
 function updateStatus(): void {
+  const now = Date.now();
+  if (now - statusStamp < 250) return;
+  statusStamp = now;
   const player = world.state.factions.player;
   const pop = world.getPopulationStats('player');
   const dayProgress = Math.floor((world.state.timeOfDay / 210) * 100);
@@ -765,7 +899,21 @@ function updateStatus(): void {
         ? ' | 城邦陷落'
         : '';
   topStatus.textContent = `${truceText}第 ${world.state.day} 天（${dayProgress}%）| ${modeText} | 已选 ${world.state.selectedUnitIds.length}${objectiveText}${outcomeText}`;
-  resourceStatus.textContent = `粮 ${Math.floor(player.resources.food)} 木 ${Math.floor(player.resources.wood)} 石 ${Math.floor(player.resources.stone)} 铁 ${Math.floor(player.resources.iron)} 金 ${Math.floor(player.resources.gold)} 人口 ${pop.used}/${pop.cap} | ${interactionHint}`;
+  const chips: Array<[string, string, number]> = [
+    ['food', '粮', player.resources.food],
+    ['wood', '木', player.resources.wood],
+    ['stone', '石', player.resources.stone],
+    ['iron', '铁', player.resources.iron],
+    ['gold', '金', player.resources.gold],
+  ];
+  resourceStatus.innerHTML =
+    chips
+      .map(
+        ([key, label, value]) =>
+          `<span class="resChip"><img src="/assets/icons/${key}.jpg" alt="${label}" width="16" height="16">${Math.floor(value)}</span>`
+      )
+      .join('') +
+    `<span class="resChip">人口 ${pop.used}/${pop.cap}</span><span class="resHint">${interactionHint}</span>`;
 }
 
 function appendBuildingDetailCard(building: Building): void {
@@ -812,6 +960,9 @@ function getUnitName(role: UnitRole): string {
     cavalry: '骑兵',
     engineer: '工兵',
     guard: '守卫',
+    ram: '冲车',
+    catapult: '投石车',
+    ladder: '云梯',
   };
   return names[role];
 }
@@ -847,8 +998,25 @@ function loop(): void {
   lastTime = now;
 
   resizeCanvas();
+  world.setSimulationFocus({
+    left: camera.x - 360,
+    top: camera.y - 360,
+    right: camera.x + canvas.width / camera.zoom + 360,
+    bottom: camera.y + canvas.height / camera.zoom + 360,
+  });
   updateCommanderFromDrag(deltaTime);
   world.update(deltaTime);
+  const alert = world.state.attackAlert;
+  if (alert && alert.until !== lastAlertUntil && alert.until > Date.now()) {
+    lastAlertUntil = alert.until;
+    playHorn(alert.kind);
+  }
+  const queueSecond = Math.floor(now / 1000);
+  if (viewedBuildingId && queueSecond !== lastQueuePanelSecond) {
+    const viewed = world.state.buildings[viewedBuildingId];
+    if (viewed?.trainQueue?.length) renderActionPanel();
+    lastQueuePanelSecond = queueSecond;
+  }
   updateCameraFollow();
   clampCamera();
   updateStatus();
@@ -867,17 +1035,82 @@ function placeWallDrag(worldPoint: RtsVector): void {
   interactionHint = placed ? '连续建造城墙中' : '这里不能建造城墙';
 }
 
-function getBuildPreview(): { type: BuildingType; x: number; y: number; valid: boolean } | undefined {
+function getBuildPreview(): { type: BuildingType; x: number; y: number; width: number; height: number; valid: boolean } | undefined {
   if (mode !== 'build' || !selectedBuild) return undefined;
-  const tileX = Math.floor(pointerCurrentWorld.x / world.state.tileSize);
-  const tileY = Math.floor(pointerCurrentWorld.y / world.state.tileSize);
+  const footprint = world.getPlacementFootprint(selectedBuild, pointerCurrentWorld);
   return {
     type: selectedBuild,
-    x: tileX * world.state.tileSize,
-    y: tileY * world.state.tileSize,
+    x: footprint.tileX * world.state.tileSize,
+    y: footprint.tileY * world.state.tileSize,
+    width: footprint.width,
+    height: footprint.height,
     valid: world.canPreviewBuilding(selectedBuild, pointerCurrentWorld),
   };
 }
+
+function ensureAudio(): AudioContext | null {
+  const AudioCtx = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+  if (!audioContext) audioContext = new AudioCtx();
+  if (audioContext.state === 'suspended') void audioContext.resume();
+  return audioContext;
+}
+
+function playHorn(kind: 'raid' | 'fall'): void {
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const beep = (frequency: number, at: number, duration: number) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = kind === 'fall' ? 'sawtooth' : 'square';
+    osc.frequency.setValueAtTime(frequency, at);
+    gain.gain.setValueAtTime(0.0001, at);
+    gain.gain.exponentialRampToValueAtTime(0.045, at + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, at + duration);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(at);
+    osc.stop(at + duration + 0.02);
+  };
+  if (kind === 'fall') {
+    beep(220, now, 0.22);
+    beep(140, now + 0.18, 0.4);
+    return;
+  }
+  beep(392, now, 0.16);
+  beep(523, now + 0.18, 0.18);
+  beep(330, now + 0.4, 0.28);
+}
+
+window.addEventListener('keydown', (event) => {
+  const target = event.target as HTMLElement | null;
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) return;
+  if (!isGameInteractive()) return;
+  const digit = Number(event.key);
+  if (!Number.isInteger(digit) || digit < 1 || digit > 9) return;
+  if (event.ctrlKey || event.metaKey) {
+    controlGroups[digit] = world.state.selectedUnitIds.filter((id) => world.state.units[id] && !world.state.units[id].garrisoned);
+    interactionHint = controlGroups[digit].length ? `编组 ${digit} 已记下 ${controlGroups[digit].length} 人` : `编组 ${digit} 已清空`;
+    event.preventDefault();
+    return;
+  }
+  const ids = (controlGroups[digit] ?? []).filter((id) => {
+    const unit = world.state.units[id];
+    return !!unit && unit.factionId === 'player' && !unit.garrisoned;
+  });
+  if (!ids.length) return;
+  Object.values(world.state.units).forEach((unit) => {
+    unit.selected = ids.includes(unit.id);
+  });
+  world.state.selectedUnitIds = ids;
+  const anchor = world.state.units[ids[0]];
+  centerCameraAt(anchor.x + anchor.width / 2, anchor.y + anchor.height / 2);
+  interactionHint = `编组 ${digit}：${ids.length} 人`;
+  setFollowedUnit(ids.length === 1 ? ids[0] : null);
+  renderActionPanel();
+  event.preventDefault();
+});
 
 document.getElementById('joinButton')!.addEventListener('click', joinGame);
 document.getElementById('playerNameInput')!.addEventListener('keypress', (event) => {
