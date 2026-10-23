@@ -24,7 +24,6 @@ const PATHFIND_MAX_ITERATIONS = 1600;
 const PATHFIND_FRAME_BUDGET = 8;
 const AI_THINK_INTERVAL = 0.4;
 const UNIT_SPATIAL_CELL = 64;
-const MAX_PATH_WAYPOINTS = 40;
 const DIRECT_PATH_TILE_THRESHOLD = 14;
 const ECONOMY_GATHER_ASSIGN_PER_TICK = 6;
 const MAX_ACTIVE_UNITS_SOFT = 120;
@@ -49,7 +48,7 @@ const BUILD_WORK_PER_SECOND = 18;
 const BUILD_WORK_RANGE = 72;
 const STUCK_UNBLOCK_SECONDS = 0.4;
 const STUCK_SIDE_STEP = TILE_SIZE * 1.15;
-const FRIENDLY_COLLISION_FACTOR = 0.28;
+const FRIENDLY_COLLISION_FACTOR = 0.42;
 
 const NPC_FACTION_IDS = [
   'north',
@@ -516,14 +515,19 @@ export class RtsWorld {
     return matches;
   }
 
-  private assignPath(unit: Unit, target: RtsVector, force = false): void {
+  private assignPath(
+    unit: Unit,
+    target: RtsVector,
+    force = false,
+    keepNear?: { point: RtsVector; maxDistance: number }
+  ): void {
     const previousFaction = this.moverFactionId;
     this.moverFactionId = unit.factionId;
-    const goal = this.nearestStandPoint(target) ?? target;
-    const start = this.centerOf(unit);
+    const goal = this.claimOpenPoint(target, unit.id, keepNear);
     unit.order.target = goal;
     unit.order.pathTarget = goal;
 
+    const start = this.centerOf(unit);
     if (this.segmentIsClear(start, goal)) {
       unit.order.path = [goal];
       this.moverFactionId = previousFaction;
@@ -537,9 +541,66 @@ export class RtsWorld {
     }
     if (!force) this.pathfindBudget -= 1;
 
-    const path = this.simplifyPath(this.findPath(start, goal));
-    unit.order.path = path.length > 0 ? path : [goal];
+    const path = this.findPath(start, goal);
+    let resolved = path;
+    if (resolved.length === 0) {
+      const gate = this.nearestFriendlyGate(unit, goal);
+      if (gate) {
+        const gatePoint = this.centerOf(gate);
+        resolved = [...this.findPath(start, gatePoint), ...this.findPath(gatePoint, goal)];
+      }
+    }
+    const simplified = this.simplifyPath(resolved);
+    unit.order.path = simplified.length > 0 ? simplified : [goal];
     this.moverFactionId = previousFaction;
+  }
+
+  /** 把落点摊到附近空地上。攻击落点必须留在射程内，避免被挤到城墙另一侧。 */
+  private claimOpenPoint(preferred: RtsVector, unitId: string, keepNear?: { point: RtsVector; maxDistance: number }): RtsVector {
+    const tile = this.worldToTile(preferred);
+    const factionId = this.moverFactionId ?? 'player';
+    const takenByAlly = (point: RtsVector) =>
+      Object.values(this.state.units).some((other) => {
+        if (other.id === unitId || other.factionId !== factionId) return false;
+        const goal = other.order.pathTarget ?? (other.order.type === 'attack' ? undefined : other.order.target);
+        return !!goal && this.pointDistance(goal, point) < 30;
+      });
+    let nearest: RtsVector | null = null;
+    let nearestDistance = Infinity;
+    for (let pass = 0; pass < 2; pass++) {
+      for (let radius = 0; radius <= 8; radius++) {
+        for (let y = tile.y - radius; y <= tile.y + radius; y++) {
+          for (let x = tile.x - radius; x <= tile.x + radius; x++) {
+            if (radius > 0 && Math.abs(x - tile.x) !== radius && Math.abs(y - tile.y) !== radius) continue;
+            if (!this.isTileWalkable(x, y)) continue;
+            const point = { x: x * TILE_SIZE + TILE_SIZE / 2, y: y * TILE_SIZE + TILE_SIZE / 2 };
+            if (this.isPointBlockedByBuilding(point, factionId)) continue;
+            const anchorDistance = keepNear ? this.pointDistance(point, keepNear.point) : 0;
+            if (keepNear && anchorDistance > keepNear.maxDistance) {
+              if (anchorDistance < nearestDistance) {
+                nearest = point;
+                nearestDistance = anchorDistance;
+              }
+              continue;
+            }
+            if (pass === 0 && takenByAlly(point)) continue;
+            return point;
+          }
+        }
+      }
+    }
+    return nearest ?? preferred;
+  }
+
+  private ringPoint(center: RtsVector, body: { width: number; height: number }, unit: Unit, index: number, total: number): RtsVector {
+    const pad = Math.max(body.width, body.height) / 2 + 20;
+    const weapon = Math.max(24, unit.range * 0.82);
+    const reach = unit.role === 'archer' || unit.role === 'catapult' ? Math.min(unit.range * 0.72, 160) : Math.min(weapon, Math.max(pad, 34));
+    const angle = (Math.PI * 2 * index) / Math.max(1, total);
+    return {
+      x: center.x + Math.cos(angle) * reach,
+      y: center.y + Math.sin(angle) * reach,
+    };
   }
 
   private nearestStandPoint(target: RtsVector): RtsVector | null {
@@ -583,12 +644,38 @@ export class RtsWorld {
     return points;
   }
 
+  private nearestFriendlyGate(unit: Unit, goal: RtsVector): Building | null {
+    const center = this.centerOf(unit);
+    let best: Building | null = null;
+    let bestScore = Infinity;
+    Object.values(this.state.buildings).forEach((building) => {
+      if (!building.complete || building.type !== 'gate' || building.factionId !== unit.factionId) return;
+      const point = this.centerOf(building);
+      const score = this.pointDistance(center, point) + this.pointDistance(point, goal) * 0.2;
+      if (score < bestScore) {
+        best = building;
+        bestScore = score;
+      }
+    });
+    return best;
+  }
+
   private simplifyPath(path: RtsVector[]): RtsVector[] {
-    if (path.length <= 2 || path.length <= MAX_PATH_WAYPOINTS) return path;
-    const step = Math.ceil(path.length / MAX_PATH_WAYPOINTS);
+    if (path.length <= 2) return path;
     const simplified: RtsVector[] = [path[0]];
-    for (let i = step; i < path.length - 1; i += step) simplified.push(path[i]);
-    simplified.push(path[path.length - 1]);
+    let index = 0;
+    while (index < path.length - 1) {
+      let furthest = index + 1;
+      const lookAhead = Math.min(path.length - 1, index + 28);
+      for (let i = lookAhead; i > index + 1; i--) {
+        if (this.segmentIsClear(path[index], path[i])) {
+          furthest = i;
+          break;
+        }
+      }
+      simplified.push(path[furthest]);
+      index = furthest;
+    }
     return simplified;
   }
 
@@ -746,14 +833,14 @@ export class RtsWorld {
         const rowStart = (row * (row + 1)) / 2;
         const col = orderIndex - rowStart;
         const width = row + 1;
-        x += (col - (width - 1) / 2) * 34;
-        y += row * 32 + entry.back * 28;
+        x += (col - (width - 1) / 2) * 46;
+        y += row * 44 + entry.back * 36;
       } else {
         const cols = Math.max(3, Math.ceil(Math.sqrt(count)));
         const col = orderIndex % cols;
         const row = Math.floor(orderIndex / cols);
-        x += (col - (cols - 1) / 2) * 36;
-        y += row * 34 + entry.back * 26;
+        x += (col - (cols - 1) / 2) * 48;
+        y += row * 46 + entry.back * 36;
       }
       points[entry.index] = { x: this.clamp(x, 16, mapRight), y: this.clamp(y, 16, mapBottom) };
     });
@@ -761,12 +848,22 @@ export class RtsWorld {
   }
 
   commandSelectedAttack(targetId: string, lockedTarget = false): void {
-    this.state.selectedUnitIds.forEach((id) => {
-      const unit = this.state.units[id];
-      if (!unit || this.isPacifistWorker(unit)) return;
+    const target = this.state.units[targetId] ?? this.state.buildings[targetId];
+    const attackers = this.state.selectedUnitIds
+      .map((id) => this.state.units[id])
+      .filter((unit): unit is Unit => !!unit && !this.isPacifistWorker(unit));
+    const previousFaction = this.moverFactionId;
+    this.moverFactionId = 'player';
+    attackers.forEach((unit, index) => {
       if (unit.garrisoned) this.exitBarracks(unit);
-      unit.order = { type: 'attack', targetId, lockedTarget };
+      const center = target ? this.centerOf(target) : undefined;
+      const hold = target && center ? this.ringPoint(center, target, unit, index, attackers.length) : undefined;
+      unit.order = { type: 'attack', targetId, lockedTarget: lockedTarget || true, target: hold, path: undefined, pathTarget: undefined };
+      if (hold && center) {
+        this.assignPath(unit, hold, true, { point: center, maxDistance: Math.max(28, unit.range * 0.92) });
+      }
     });
+    this.moverFactionId = previousFaction;
   }
 
   commandSelectedGather(world: RtsVector): boolean {
@@ -2572,6 +2669,10 @@ export class RtsWorld {
     return ['swordsman', 'spearman', 'archer', 'cavalry', 'guard', 'ram', 'catapult', 'ladder'].includes(role);
   }
 
+  private isFlowingOrder(type: Unit['order']['type']): boolean {
+    return type === 'build' || type === 'gather' || type === 'move' || type === 'attack' || type === 'attackMove' || type === 'patrol' || type === 'guard';
+  }
+
   private isSoldier(unit: Unit): boolean {
     return this.isMilitaryRole(unit.role);
   }
@@ -3063,12 +3164,34 @@ export class RtsWorld {
 
     const distance = this.distance(unit, attackTarget);
     if (distance > unit.range) {
-      const targetPoint = this.centerOf(attackTarget);
-      this.ensurePath(unit, targetPoint);
-      this.moveAlongPath(unit, deltaTime, Math.max(12, unit.range * 0.75));
+      const center = this.centerOf(attackTarget);
+      const hold = unit.order.pathTarget ?? unit.order.target;
+      const holdDistance = hold ? this.pointDistance(hold, center) : Infinity;
+      if (!hold || holdDistance > unit.range * 0.92) {
+        if (!this.moveToward(unit, center, deltaTime, Math.max(8, unit.range * 0.7))) {
+          if (!hold || this.pointDistance(hold, center) > unit.range + 90) {
+            const allies = this.unitListCache.filter(
+              (other) => other.factionId === unit.factionId && other.order.type === 'attack' && other.order.targetId === attackTarget.id
+            );
+            const index = Math.max(0, allies.findIndex((other) => other.id === unit.id));
+            const next = this.ringPoint(center, attackTarget, unit, index, Math.max(1, allies.length));
+            this.assignPath(unit, next, true, { point: center, maxDistance: Math.max(28, unit.range * 0.92) });
+          }
+          this.moveAlongPath(unit, deltaTime, 16);
+        }
+        return;
+      }
+      if (this.pointDistance(this.centerOf(unit), hold) <= 20) {
+        if (!this.moveToward(unit, center, deltaTime, Math.max(8, unit.range * 0.7))) {
+          this.moveAlongPath(unit, deltaTime, 16);
+        }
+        return;
+      }
+      this.moveAlongPath(unit, deltaTime, 16);
       return;
     }
 
+    unit.order.path = [];
     if (unit.attackCooldown <= 0) this.strike(unit, attackTarget);
   }
 
@@ -3144,7 +3267,7 @@ export class RtsWorld {
   }
 
   private retargetNearbyEnemyUnit(unit: Unit): void {
-    if (unit.order.lockedTarget && unit.order.targetId && this.state.buildings[unit.order.targetId]) return;
+    if (unit.order.lockedTarget && unit.order.targetId) return;
     if (this.isTruceActive() && this.isNpcFaction(unit.factionId)) return;
 
     const enemies = this.getEnemyFactionIds(unit.factionId);
@@ -3169,7 +3292,7 @@ export class RtsWorld {
     if (defender.factionId === attacker.factionId) return;
     if (this.isNpcPeaceBlocked(attacker.factionId, defender.factionId)) return;
     if (this.isPacifistWorker(defender)) return;
-    if (defender.order.lockedTarget && defender.order.targetId && this.state.buildings[defender.order.targetId]) return;
+    if (defender.order.lockedTarget && defender.order.targetId) return;
     defender.order = { type: 'attack', targetId: attacker.id, lockedTarget: false };
     defender.order.path = undefined;
     defender.order.pathTarget = undefined;
@@ -3642,7 +3765,11 @@ export class RtsWorld {
 
     const center = this.centerOf(unit);
     const finalDistance = this.pointDistance(center, target);
-    if (finalDistance <= stopDistance || (finalDistance <= 40 && this.friendlyBlocksGoal(unit, target))) {
+    if (finalDistance <= stopDistance) {
+      unit.order.path = [];
+      return true;
+    }
+    if (unit.order.type === 'move' && finalDistance <= 36 && this.friendlyBlocksGoal(unit, target)) {
       unit.order.path = [];
       return true;
     }
@@ -3665,6 +3792,20 @@ export class RtsWorld {
     if (moved) {
       this.stuckUnits.delete(unit.id);
       return false;
+    }
+
+    if (this.isFlowingOrder(unit.order.type)) {
+      const dx = currentTarget.x - center.x;
+      const dy = currentTarget.y - center.y;
+      const length = Math.hypot(dx, dy) || 1;
+      const px = -dy / length;
+      const py = dx / length;
+      const toward = (side: number) =>
+        Math.hypot(center.x + px * side - currentTarget.x, center.y + py * side - currentTarget.y);
+      const sides = toward(1) <= toward(-1) ? [1, -1] : [-1, 1];
+      for (const side of sides) {
+        if (this.moveUnitByVector(unit, px * side, py * side, deltaTime)) return false;
+      }
     }
 
     if (this.tryUnstickUnit(unit, currentTarget, target, deltaTime)) {
@@ -3782,10 +3923,15 @@ export class RtsWorld {
 
     return !Object.values(this.state.units).some((other) => {
       if (other.id === unit.id) return false;
-      let minDist = UNIT_COLLISION_RADIUS * 2.2;
-      if (other.factionId === unit.factionId && ['build', 'gather', 'move'].includes(other.order.type)) {
-        minDist *= 0.55;
+      if (
+        other.factionId === unit.factionId &&
+        this.isFlowingOrder(unit.order.type) &&
+        this.isFlowingOrder(other.order.type)
+      ) {
+        return false;
       }
+      const minDist =
+        other.factionId === unit.factionId ? UNIT_COLLISION_RADIUS * 2.2 * FRIENDLY_COLLISION_FACTOR : UNIT_COLLISION_RADIUS * 2.2;
       return this.pointDistance(center, this.centerOf(other)) < minDist;
     });
   }
@@ -3830,32 +3976,28 @@ export class RtsWorld {
           const a = units[i];
           const b = neighbors[j];
           if (a.id >= b.id) continue;
+          const aFlow = this.isFlowingOrder(a.order.type);
+          const bFlow = this.isFlowingOrder(b.order.type);
+          if (a.factionId === b.factionId && aFlow && bFlow) continue;
           const ac = this.centerOf(a);
           const bc = this.centerOf(b);
           let dx = ac.x - bc.x;
           let dy = ac.y - bc.y;
           let distance = Math.sqrt(dx * dx + dy * dy);
           let minDistance = UNIT_COLLISION_RADIUS * 2;
-          if (a.factionId === b.factionId) {
-            const bothWorking = ['build', 'gather', 'move'].includes(a.order.type) && ['build', 'gather', 'move'].includes(b.order.type);
-            if (bothWorking) minDistance *= FRIENDLY_COLLISION_FACTOR;
-          }
+          if (a.factionId === b.factionId) minDistance *= FRIENDLY_COLLISION_FACTOR;
           if (distance >= minDistance) continue;
           if (distance === 0) {
-            dx = Math.random() - 0.5;
-            dy = Math.random() - 0.5;
-            distance = Math.sqrt(dx * dx + dy * dy);
+            dx = (this.hashUnitId(a.id) % 7) - 3;
+            dy = (this.hashUnitId(b.id) % 7) - 3;
+            distance = Math.sqrt(dx * dx + dy * dy) || 1;
           }
           const push = (minDistance - distance) * (a.factionId === b.factionId ? 0.35 : 0.5);
           const nx = dx / distance;
           const ny = dy / distance;
-          const goalDistance = (unit: Unit, center: RtsVector) =>
-            unit.order.type === 'move' && unit.order.target ? this.pointDistance(center, unit.order.target) : 0;
-          const aGoal = goalDistance(a, ac);
-          const bGoal = goalDistance(b, bc);
-          if (a.factionId === b.factionId && Math.abs(aGoal - bGoal) > 8) {
-            if (aGoal > bGoal) this.tryMoveUnit(a, a.x + nx * push, a.y + ny * push);
-            else this.tryMoveUnit(b, b.x - nx * push, b.y - ny * push);
+          if (a.factionId === b.factionId && aFlow !== bFlow) {
+            if (aFlow) this.tryMoveUnit(b, b.x - nx * push, b.y - ny * push);
+            else this.tryMoveUnit(a, a.x + nx * push, a.y + ny * push);
           } else {
             this.tryMoveUnit(a, a.x + nx * push, a.y + ny * push);
             this.tryMoveUnit(b, b.x - nx * push, b.y - ny * push);
@@ -4047,10 +4189,10 @@ export class RtsWorld {
 
   private findPath(startWorld: RtsVector, endWorld: RtsVector): RtsVector[] {
     const start = this.worldToTile(startWorld);
-    const end = this.findNearestWalkableTile(this.worldToTile(endWorld));
+    const end = this.findNearestWalkableTile(this.worldToTile(endWorld), endWorld);
     if (!end) return [];
     if (!this.isTileWalkable(start.x, start.y)) {
-      const escaped = this.findNearestWalkableTile(start);
+      const escaped = this.findNearestWalkableTile(start, startWorld);
       if (!escaped) return [];
       start.x = escaped.x;
       start.y = escaped.y;
@@ -4140,14 +4282,24 @@ export class RtsWorld {
       });
   }
 
-  private findNearestWalkableTile(tile: { x: number; y: number }): { x: number; y: number } | null {
+  private findNearestWalkableTile(tile: { x: number; y: number }, prefer?: RtsVector): { x: number; y: number } | null {
     if (this.isTileWalkable(tile.x, tile.y)) return tile;
-    for (let radius = 1; radius <= 8; radius++) {
+    const origin = prefer ?? { x: tile.x * TILE_SIZE + TILE_SIZE / 2, y: tile.y * TILE_SIZE + TILE_SIZE / 2 };
+    for (let radius = 1; radius <= 10; radius++) {
+      let best: { x: number; y: number } | null = null;
+      let bestDistance = Infinity;
       for (let y = tile.y - radius; y <= tile.y + radius; y++) {
         for (let x = tile.x - radius; x <= tile.x + radius; x++) {
-          if (this.isTileWalkable(x, y)) return { x, y };
+          if (Math.abs(x - tile.x) !== radius && Math.abs(y - tile.y) !== radius) continue;
+          if (!this.isTileWalkable(x, y)) continue;
+          const distance = Math.hypot(x * TILE_SIZE + TILE_SIZE / 2 - origin.x, y * TILE_SIZE + TILE_SIZE / 2 - origin.y);
+          if (distance < bestDistance) {
+            best = { x, y };
+            bestDistance = distance;
+          }
         }
       }
+      if (best) return best;
     }
     return null;
   }
